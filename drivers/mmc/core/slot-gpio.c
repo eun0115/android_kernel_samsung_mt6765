@@ -19,12 +19,16 @@
 #include <linux/slab.h>
 
 #include "slot-gpio.h"
+#include "core.h"
+
+extern int mmc_get_cd_level(struct mmc_host *mmc);
 
 struct mmc_gpio {
 	struct gpio_desc *ro_gpio;
 	struct gpio_desc *cd_gpio;
 	bool override_ro_active_level;
 	bool override_cd_active_level;
+	bool status;
 	irqreturn_t (*cd_gpio_isr)(int irq, void *dev_id);
 	char *ro_label;
 	u32 cd_debounce_delay_ms;
@@ -36,9 +40,25 @@ static irqreturn_t mmc_gpio_cd_irqt(int irq, void *dev_id)
 	/* Schedule a card detection after a debounce timeout */
 	struct mmc_host *host = dev_id;
 	struct mmc_gpio *ctx = host->slot.handler_priv;
+	bool status;
 
-	host->trigger_card_event = true;
-	mmc_detect_change(host, msecs_to_jiffies(ctx->cd_debounce_delay_ms));
+	status = mmc_gpio_get_cd(host) ? true : false;
+
+	if (status ^ ctx->status) {
+		pr_err("%s: slot status change detected (%d -> %d), GPIO_ACTIVE_%s\n",
+				mmc_hostname(host), ctx->status, status,
+				mmc_get_cd_level(host) ? "HIGH" : "LOW");
+		ST_LOG("%s: slot status change detected (%d -> %d), GPIO_ACTIVE_%s\n",
+				mmc_hostname(host), ctx->status, status,
+				mmc_get_cd_level(host) ? "HIGH" : "LOW");
+		ctx->status = status;
+		host->trigger_card_event = true;
+
+		if (host->card_detect_cnt < UINT_MAX)
+			host->card_detect_cnt++;
+
+		mmc_detect_change(host, msecs_to_jiffies(200));
+	}
 
 	return IRQ_HANDLED;
 }
@@ -143,6 +163,8 @@ void mmc_gpiod_request_cd_irq(struct mmc_host *host)
 	 */
 	if (!(host->caps & MMC_CAP_NEEDS_POLL))
 		irq = gpiod_to_irq(ctx->cd_gpio);
+
+	ctx->status = mmc_gpio_get_cd(host) ? true : false;
 
 	if (irq >= 0) {
 		if (!ctx->cd_gpio_isr)
